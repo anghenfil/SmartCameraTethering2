@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <link rel="stylesheet" href="assets/css/bootstrap.min.css">
+    <link rel="stylesheet" href="assets/css/app.css">
+    <meta charset="UTF-8">
+    <title>Smart Camera Tethering</title>
+</head>
+<body class="py-4">
+<div class="container">
+    <div class="alert-container">
+        <div class="alert hide" role="alert" id="alert">
+
+        </div>
+    </div>
+    <div class="accordion " id="accordion">
+        <div class="accordion-item">
+            <h2 class="accordion-header" id="flush-headingOne">
+                <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#flush-collapseOne" aria-expanded="false" aria-controls="flush-collapseOne">
+                    Connection to Camera
+                </button>
+            </h2>
+            <div id="flush-collapseOne" class="accordion-collapse collapse show" aria-labelledby="flush-headingOne">
+                <div class="accordion-body">
+                    <div class="row d-flex align-items-center">
+                        <div class="col">
+                            <label>Connection Status:</label>
+                        </div>
+                        <div class="col">
+                            <span id="cameraStatus">Disconnected</span>
+                        </div>
+                        <div class="col">
+                            <select class="form-select" aria-label="Camera Select" id="availableCameras">
+                                <option selected>No cameras available</option>
+                            </select>
+                        </div>
+                        <div class="col">
+                            <button class="btn btn-primary" id="connect">Connect</button>
+                            <button class="btn btn-primary hide" id="disconnect">Disconnect</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="accordion-item">
+            <h2 class="accordion-header" id="flush-headingTwo">
+                <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#flush-collapseTwo" aria-expanded="false" aria-controls="flush-collapseTwo">
+                    Image
+                </button>
+            </h2>
+            <div id="flush-collapseTwo" class="accordion-collapse collapse show" aria-labelledby="flush-headingTwo">
+                <div class="accordion-body">
+                    <div id="preview-control" class="mb-2">
+                        <button class="btn btn-sm btn-primary" id="startPreview">Start Preview</button>
+                        <button class="btn btn-sm btn-primary hide" id="stopPreview">Stop Preview</button></div>
+                    <img id="image" class="img-fluid" src="" alt="">
+                </div>
+            </div>
+        </div>
+        <div class="accordion-item">
+            <h2 class="accordion-header" id="flush-headingThree">
+                <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#flush-collapseThree" aria-expanded="false" aria-controls="flush-collapseThree">
+                    Camera Settings
+                </button>
+            </h2>
+            <div id="flush-collapseThree" class="accordion-collapse collapse show" aria-labelledby="flush-headingThree">
+                <div class="accordion-body">
+                    <div class="col" id="cameraSettings">
+
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="accordion-item">
+            <h2 class="accordion-header" id="flush-headingFour">
+                <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#flush-collapseFour" aria-expanded="false" aria-controls="flush-collapseFour">
+                    Capture
+                </button>
+            </h2>
+            <div id="flush-collapseFour" class="accordion-collapse collapse show" aria-labelledby="flush-headingFour">
+                <div class="accordion-body">
+                    <div class="form-check mb-3">
+                        <label for="capture_interval" class="form-check-label">Interval Capture</label>
+                        <input type="checkbox" class="form-check-input" id="capture_interval">
+                    </div>
+                    <div class="card mb-3 hide" id="capture_interval_settings">
+                        <div class="card-header">
+                            Interval Settings
+                        </div>
+                        <div class="card-body">
+                            <div class="input-group mb-3">
+                                <label class="input-group-text">Number of Shots</label>
+                                <input type="number" min="1" value="2" class="form-control" aria-label="Number of Shots" id="capture_number_of_shots"/>
+                            </div>
+                            <div class="input-group mb-3">
+                                <label class="input-group-text">Interval between shots (in seconds)</label>
+                                <input type="number" min="0,1" value="1" class="form-control" aria-label="Interval Time" id="capture_interval_time"/>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="input-group mb-3">
+                        <label class="input-group-text">ISO</label>
+                        <select class="form-select" aria-label="ISO" id="capture_iso" data-setting-name="main.imgsettings.iso"></select>
+                    </div>
+                    <div class="input-group mb-3">
+                        <label class="input-group-text">Shutter Speed</label>
+                        <select class="form-select" aria-label="Shutter Speed" id="capture_shutter_speed" data-setting-name="main.capturesettings.shutterspeed"></select>
+                    </div>
+                    <div class="input-group mb-3 hide" id="bulb_exposure_time_container">
+                        <label class="input-group-text">Bulb Exposure Time in seconds</label>
+                        <input type="number" min="0,5" class="form-control" aria-label="Exposure Time in seconds" id="capture_bulb_exposure_time" />
+                    </div>
+                    <div class="input-group mb-3">
+                        <label class="input-group-text">Aperture</label>
+                        <select class="form-select" aria-label="Aperture" id="capture_aperture" data-setting-name="main.capturesettings.f-number"></select>
+                    </div>
+                    <div class="input-group mb-3">
+                        <label class="input-group-text">Focus Mode</label>
+                        <select class="form-select" aria-label="Focus Mode" id="capture_focus_mode" data-setting-name="main.capturesettings.focusmode"></select>
+                    </div>
+                    <div class="input-group mb-3">
+                        <label class="input-group-text">Exposure Compensation</label>
+                        <select class="form-select" aria-label="Exposure Compensation" id="capture_exposure_compensation" data-setting-name="main.capturesettings.exposurecompensation"></select>
+                    </div>
+                    <button class="btn btn-primary" id="capture">Capture</button>
+                    <button class="btn btn-danger hide" id="cancel_capture" style="float: right;">Cancel Captures</button>
+                </div>
+            </div>
+        </div>
+        <div class="accordion-item">
+            <h2 class="accordion-header" id="flush-headingFive">
+                <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#flush-collapseFive" aria-expanded="false" aria-controls="flush-collapseFive">
+                    Post-Processing
+                </button>
+            </h2>
+            <div id="flush-collapseFive" class="accordion-collapse collapse show" aria-labelledby="flush-headingFive">
+                <div class="accordion-body">
+                    <div id="post_processing_configs">
+                        <!-- Post Processing Configs will be added here -->
+                    </div>
+                    <button class="btn btn-sm btn-secondary mb-3" id="add_post_processing_config">Add Config</button>
+                    <div class="mt-3">
+                        <button class="btn btn-outline-secondary" id="set_default_post_processing">Set Default (JPEG Return)</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+<script src="assets/js/bootstrap.bundle.min.js"></script>
+<script src="assets/js/bundle.js"></script>
+</body>
+</html>

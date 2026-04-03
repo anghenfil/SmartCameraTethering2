@@ -1,0 +1,18 @@
+[package]
+name = "SmartCameraTethering2"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+rsraw = "0.1.1"
+rsraw-utils = {git = "https://github.com/anghenfil/rsraw-utils.git"}
+image = "0.25"
+tokio = {version = "1", features = ["full"]}
+gphoto2 = "3.4.1"
+serde = { version = "1.0.228", features = ["derive"] }
+reqwest = { version = "0.13", features = ["json", "stream"] }
+tower-http = {version = "0.6.8", features = ["fs"]}
+futures-util = "0.3.32"
+serde_json = "1"
+uuid = {version = "1.22", features = ["v4"]}

@@ -1,0 +1,11 @@
+.hide{
+    display: none;
+}
+
+.alert-container{
+    position: fixed;
+    z-index: 10;
+    opacity: 0.8;
+    left: 10px;
+    right: 10px;
+}
