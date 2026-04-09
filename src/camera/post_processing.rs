@@ -13,10 +13,10 @@ use SmartCameraTethering2_shared_types::{MessageToCameraServer, MessageToPostPro
 use crate::camera::worker::{CameraConnection, CameraError};
 use crate::websocket::scheme::{Image, ImageSource, MessageToClient};
 
-const SERVER_HOST: &str = "localhost";
+const SERVER_HOST: &str = "anghenfil.de";
 const SERVER_PORT: u16 = 9000;
-const CERT_PATH: &str = "certs/client2.crt";
-const KEY_PATH: &str = "certs/client2.key";
+const CERT_PATH: &str = "certs/client.crt";
+const KEY_PATH: &str = "certs/client.key";
 const CA_PATH: &str = "certs/root.crt";
 
 #[derive(Debug, Clone)]
@@ -72,10 +72,25 @@ pub fn start_post_processing_worker(
                             println!("Received new post processing config: {:?}", new_config);
                             config = new_config;
                             let mut w = write_half.lock().await;
-                            if let Some(ref mut writer) = *w {
-                                if let Err(e) = send_framed(writer, &MessageToPostProcessor::SetPostProcessorConfig(config.clone())).await {
+                            if w.is_none() {
+                                drop(w);
+                                let sid = *session_id.lock().await;
+                                let is_resume = sid.is_some();
+                                establish_connection(
+                                    &tls_connector,
+                                    &write_half,
+                                    &session_id,
+                                    &config,
+                                    &msg2client_sender,
+                                    disconnect_tx.clone(),
+                                    is_resume,
+                                ).await;
+                            } else {
+                                if let Some(ref mut writer) = *w {
+                                    if let Err(e) = send_framed(writer, &MessageToPostProcessor::SetPostProcessorConfig(config.clone())).await {
                                         eprintln!("Failed to send config to post-processing server: {:?}", e);
                                     }
+                                }
                             }
                         }
                         None => {
@@ -88,17 +103,22 @@ pub fn start_post_processing_worker(
                     match event {
                         Ok(event) => {
                             if let CameraEvent::NewFile(new_file) = event.as_ref() {
+                                let event_received_at = std::time::Instant::now();
                                 let file_path: CameraFilePath = new_file.into();
+                                println!("[TIMING] NewFile event received: {}/{}", file_path.folder, file_path.file);
                                 let name_lower = file_path.file.to_lowercase();
 
                                 if name_lower.ends_with(".jpg") || name_lower.ends_with(".jpeg") {
                                     // JPG: download and send directly to client
                                     if let Some(conn) = &mut connection {
+                                        println!("[TIMING] +{:.1}ms — starting JPG download", event_received_at.elapsed().as_secs_f64() * 1000.0);
                                         match conn.camera.fs().download(&file_path.folder, &file_path.file).await {
                                             Ok(img) => match img.get_data(&conn.context).await {
                                                 Ok(data) => {
+                                                    println!("[TIMING] +{:.1}ms — JPG downloaded ({} bytes), sending to client", event_received_at.elapsed().as_secs_f64() * 1000.0, data.len());
                                                     let image = Image::new(data.to_vec(), "image/jpeg".to_string(), ImageSource::Capture);
                                                     let _ = msg2client_sender.send(MessageToClient::Image(image));
+                                                    println!("[TIMING] +{:.1}ms — JPG sent to client", event_received_at.elapsed().as_secs_f64() * 1000.0);
                                                 }
                                                 Err(e) => {
                                                     let _ = msg2client_sender.send(MessageToClient::CameraError(e.into()));
@@ -112,6 +132,7 @@ pub fn start_post_processing_worker(
                                 } else {
                                     // RAW: send to post-processing server in a background task
                                     // so the select! loop is not blocked during the transfer
+                                    println!("[TIMING] +{:.1}ms — RAW file, spawning background send task", event_received_at.elapsed().as_secs_f64() * 1000.0);
                                     if let Some(conn) = &connection {
                                         let conn = conn.clone();
                                         let file_path = file_path.clone();
@@ -122,13 +143,19 @@ pub fn start_post_processing_worker(
                                         let disconnect_tx = disconnect_tx.clone();
                                         let tls_connector = tls_connector.clone();
 
+                                        let compress = config.iter().any(|c| c.compress);
                                         tokio::task::spawn(async move {
+                                            println!("[TIMING] +{:.1}ms — background task started", event_received_at.elapsed().as_secs_f64() * 1000.0);
                                             let mut last_err = None;
                                             for attempt in 1..=3 {
+                                                println!("[TIMING] +{:.1}ms — attempt {}/3: acquiring write lock", event_received_at.elapsed().as_secs_f64() * 1000.0, attempt);
                                                 let mut w = write_half.lock().await;
+                                                println!("[TIMING] +{:.1}ms — attempt {}/3: lock acquired", event_received_at.elapsed().as_secs_f64() * 1000.0, attempt);
                                                 if let Some(ref mut writer) = *w {
-                                                    match send_raw_to_server(writer, &conn, &file_path).await {
+                                                    println!("[TIMING] +{:.1}ms — attempt {}/3: starting send_raw_to_server", event_received_at.elapsed().as_secs_f64() * 1000.0, attempt);
+                                                    match send_raw_to_server(writer, &conn, &file_path, compress).await {
                                                         Ok(_) => {
+                                                            println!("[TIMING] +{:.1}ms — attempt {}/3: send_raw_to_server succeeded", event_received_at.elapsed().as_secs_f64() * 1000.0, attempt);
                                                             last_err = None;
                                                             break;
                                                         }
@@ -136,14 +163,27 @@ pub fn start_post_processing_worker(
                                                             eprintln!("Error sending raw to post-processing server (attempt {}/3): {:?}", attempt, e);
                                                             last_err = Some(e);
                                                             *w = None;
+                                                            drop(w);
+                                                            if attempt < 3 {
+                                                                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                                                                let sid = *session_id.lock().await;
+                                                                let is_resume = sid.is_some();
+                                                                establish_connection(
+                                                                    &tls_connector,
+                                                                    &write_half,
+                                                                    &session_id,
+                                                                    &config,
+                                                                    &msg2client_sender,
+                                                                    disconnect_tx.clone(),
+                                                                    is_resume,
+                                                                ).await;
+                                                            }
+                                                            continue;
                                                         }
                                                     }
                                                 } else {
-                                                    break;
-                                                }
-                                                drop(w);
-                                                if attempt < 3 {
-                                                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                                                    // No connection yet — try to establish one before retrying
+                                                    drop(w);
                                                     let sid = *session_id.lock().await;
                                                     let is_resume = sid.is_some();
                                                     establish_connection(
@@ -155,6 +195,9 @@ pub fn start_post_processing_worker(
                                                         disconnect_tx.clone(),
                                                         is_resume,
                                                     ).await;
+                                                    if attempt < 3 {
+                                                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                                                    }
                                                 }
                                             }
                                             if let Some(e) = last_err {
@@ -400,14 +443,30 @@ async fn send_raw_to_server(
     writer: &mut tokio::io::WriteHalf<TlsStream<TcpStream>>,
     connection: &CameraConnection,
     image_path: &CameraFilePath,
+    compress: bool,
 ) -> Result<(), CameraError> {
+    let t0 = std::time::Instant::now();
     let img = connection.camera.fs().download(&image_path.folder, &image_path.file).await?;
+    println!("[TIMING] send_raw_to_server: fs().download() done in {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
     let img_data = img.get_data(&connection.context).await?;
+    println!("[TIMING] send_raw_to_server: get_data() done in {:.1}ms ({} bytes total)", t0.elapsed().as_secs_f64() * 1000.0, img_data.len());
 
-    println!("Sending raw image ({} bytes) to post-processing server...", img_data.len());
+    let msg = if compress {
+        let t_compress = std::time::Instant::now();
+        // zstd level 1: fastest, good ratio, suitable for Raspberry Pi Zero 2
+        let compressed = zstd::encode_all(img_data.as_ref(), 1)
+            .map_err(|e| CameraError::RsRawUtilError(format!("Compression failed: {e}")))?;
+        println!("[TIMING] send_raw_to_server: zstd compression done in {:.1}ms ({} -> {} bytes, {:.1}% of original)",
+            t_compress.elapsed().as_secs_f64() * 1000.0, img_data.len(), compressed.len(),
+            compressed.len() as f64 / img_data.len() as f64 * 100.0);
+        MessageToPostProcessor::CompressedRawImage(compressed)
+    } else {
+        MessageToPostProcessor::RawImage(img_data.to_vec())
+    };
 
-    send_framed(writer, &MessageToPostProcessor::RawImage(img_data.to_vec())).await
+    send_framed(writer, &msg).await
         .map_err(|e| CameraError::RsRawUtilError(format!("Send failed: {e}")))?;
+    println!("[TIMING] send_raw_to_server: send_framed() done in {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
 
     Ok(())
 }

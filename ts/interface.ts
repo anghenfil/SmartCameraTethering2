@@ -336,6 +336,10 @@ function add_post_processing_config_ui(config?: PostProcessingConfig) {
                 <span class="input-group-text">Trigger Every N Images</span>
                 <input type="number" class="form-control trigger-every" min="1" value="${config?.trigger_every_n_images || 1}">
             </div>
+            <div class="form-check mb-3">
+                <input class="form-check-input compress-raw" type="checkbox" ${config?.compress ? 'checked' : ''}>
+                <label class="form-check-label">Compress RAW before sending (zstd)</label>
+            </div>
             <h6>Steps</h6>
             <div class="steps-container"></div>
             <button class="btn btn-sm btn-outline-secondary add-step">Add Step</button>
@@ -354,6 +358,9 @@ function add_post_processing_config_ui(config?: PostProcessingConfig) {
     const triggerInput = configDiv.querySelector(".trigger-every") as HTMLInputElement;
     triggerInput.addEventListener("change", apply_post_processing);
     triggerInput.addEventListener("input", apply_post_processing);
+
+    const compressInput = configDiv.querySelector(".compress-raw") as HTMLInputElement;
+    compressInput.addEventListener("change", apply_post_processing);
 
     if (config) {
         config.steps.forEach(step => add_step_ui(configDiv.querySelector(".steps-container")!, step));
@@ -549,9 +556,11 @@ function apply_post_processing() {
             }
         });
 
+        const compress = (configDiv.querySelector(".compress-raw") as HTMLInputElement).checked;
         configs.push({
             trigger_every_n_images: triggerEvery,
-            steps: steps
+            steps: steps,
+            compress: compress
         });
     });
 
