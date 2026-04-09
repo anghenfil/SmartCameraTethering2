@@ -3,7 +3,30 @@ use gphoto2::abilities::FolderOperations;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use rsraw_utils::blending::BlendingMode;
-use SmartCameraTethering2_shared_types::PostProcessingConfig;
+use SmartCameraTethering2_shared_types::{PostProcessingConfig as SharedPostProcessingConfig, PostProcessingStep};
+
+/// Local wrapper for PostProcessingConfig that includes transport-only fields
+/// (compress, compression_level) which are irrelevant to the post-processing server.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PostProcessingConfig {
+    pub steps: Vec<PostProcessingStep>,
+    pub trigger_every_n_images: u32,
+    #[serde(default)]
+    pub compress: bool,
+    #[serde(default = "default_compression_level")]
+    pub compression_level: u8,
+}
+
+fn default_compression_level() -> u8 { 1 }
+
+impl From<PostProcessingConfig> for SharedPostProcessingConfig {
+    fn from(c: PostProcessingConfig) -> Self {
+        SharedPostProcessingConfig {
+            steps: c.steps,
+            trigger_every_n_images: c.trigger_every_n_images,
+        }
+    }
+}
 
 // first byte of websocket messages
 #[derive(Debug, Serialize, Deserialize, Clone)]

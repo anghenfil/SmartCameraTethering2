@@ -9,7 +9,8 @@ use tokio::net::TcpStream;
 use rustls::ClientConfig;
 use rustls::RootCertStore;
 use rustls::pki_types::ServerName;
-use SmartCameraTethering2_shared_types::{MessageToCameraServer, MessageToPostProcessor, PostProcessingConfig};
+use SmartCameraTethering2_shared_types::{MessageToCameraServer, MessageToPostProcessor};
+use crate::websocket::scheme::PostProcessingConfig;
 use crate::camera::worker::{CameraConnection, CameraError};
 use crate::websocket::scheme::{Image, ImageSource, MessageToClient};
 
@@ -34,12 +35,26 @@ impl From<&gphoto2::file::CameraFilePath> for CameraFilePath {
     }
 }
 
+/// Item queued for post-processing: a RAW file to be sent to the server.
+struct PostProcessingItem {
+    conn: CameraConnection,
+    file_path: CameraFilePath,
+    compress: bool,
+    compression_level: u8,
+    enqueued_at: std::time::Instant,
+}
+
+const POST_PROCESSING_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
+
 pub fn start_post_processing_worker(
     event_channel: tokio::sync::broadcast::Sender<Arc<CameraEvent>>,
     mut connection_channel: tokio::sync::broadcast::Receiver<Option<CameraConnection>>,
     msg2client_sender: tokio::sync::broadcast::Sender<MessageToClient>,
 ) -> tokio::sync::mpsc::Sender<Vec<PostProcessingConfig>> {
     let (sender, mut recv) = tokio::sync::mpsc::channel::<Vec<PostProcessingConfig>>(3);
+
+    // Queue for RAW images waiting to be sent to the post-processing server (one at a time)
+    let (queue_tx, queue_rx) = tokio::sync::mpsc::channel::<PostProcessingItem>(64);
 
     tokio::task::spawn(async move {
         let mut config: Vec<PostProcessingConfig> = vec![];
@@ -62,6 +77,23 @@ pub fn start_post_processing_worker(
 
         // Channel to signal that the reader task detected a disconnect
         let (disconnect_tx, mut disconnect_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+        // Spawn the single post-processing queue worker
+        {
+            let write_half = write_half.clone();
+            let session_id = session_id.clone();
+            let msg2client_sender = msg2client_sender.clone();
+            let disconnect_tx = disconnect_tx.clone();
+            let tls_connector = tls_connector.clone();
+            tokio::task::spawn(post_processing_queue_worker(
+                queue_rx,
+                write_half,
+                session_id,
+                msg2client_sender,
+                disconnect_tx,
+                tls_connector,
+            ));
+        }
 
         let mut event_channel_receiver = event_channel.subscribe();
         loop {
@@ -87,7 +119,7 @@ pub fn start_post_processing_worker(
                                 ).await;
                             } else {
                                 if let Some(ref mut writer) = *w {
-                                    if let Err(e) = send_framed(writer, &MessageToPostProcessor::SetPostProcessorConfig(config.clone())).await {
+                                    if let Err(e) = send_framed(writer, &MessageToPostProcessor::SetPostProcessorConfig(config.iter().cloned().map(Into::into).collect())).await {
                                         eprintln!("Failed to send config to post-processing server: {:?}", e);
                                     }
                                 }
@@ -130,81 +162,21 @@ pub fn start_post_processing_worker(
                                         }
                                     }
                                 } else {
-                                    // RAW: send to post-processing server in a background task
-                                    // so the select! loop is not blocked during the transfer
-                                    println!("[TIMING] +{:.1}ms — RAW file, spawning background send task", event_received_at.elapsed().as_secs_f64() * 1000.0);
+                                    // RAW: enqueue for sequential post-processing (one at a time)
+                                    println!("[TIMING] +{:.1}ms — RAW file, enqueueing for post-processing", event_received_at.elapsed().as_secs_f64() * 1000.0);
                                     if let Some(conn) = &connection {
-                                        let conn = conn.clone();
-                                        let file_path = file_path.clone();
-                                        let write_half = write_half.clone();
-                                        let session_id = session_id.clone();
-                                        let config = config.clone();
-                                        let msg2client_sender = msg2client_sender.clone();
-                                        let disconnect_tx = disconnect_tx.clone();
-                                        let tls_connector = tls_connector.clone();
-
                                         let compress = config.iter().any(|c| c.compress);
-                                        tokio::task::spawn(async move {
-                                            println!("[TIMING] +{:.1}ms — background task started", event_received_at.elapsed().as_secs_f64() * 1000.0);
-                                            let mut last_err = None;
-                                            for attempt in 1..=3 {
-                                                println!("[TIMING] +{:.1}ms — attempt {}/3: acquiring write lock", event_received_at.elapsed().as_secs_f64() * 1000.0, attempt);
-                                                let mut w = write_half.lock().await;
-                                                println!("[TIMING] +{:.1}ms — attempt {}/3: lock acquired", event_received_at.elapsed().as_secs_f64() * 1000.0, attempt);
-                                                if let Some(ref mut writer) = *w {
-                                                    println!("[TIMING] +{:.1}ms — attempt {}/3: starting send_raw_to_server", event_received_at.elapsed().as_secs_f64() * 1000.0, attempt);
-                                                    match send_raw_to_server(writer, &conn, &file_path, compress).await {
-                                                        Ok(_) => {
-                                                            println!("[TIMING] +{:.1}ms — attempt {}/3: send_raw_to_server succeeded", event_received_at.elapsed().as_secs_f64() * 1000.0, attempt);
-                                                            last_err = None;
-                                                            break;
-                                                        }
-                                                        Err(e) => {
-                                                            eprintln!("Error sending raw to post-processing server (attempt {}/3): {:?}", attempt, e);
-                                                            last_err = Some(e);
-                                                            *w = None;
-                                                            drop(w);
-                                                            if attempt < 3 {
-                                                                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                                                                let sid = *session_id.lock().await;
-                                                                let is_resume = sid.is_some();
-                                                                establish_connection(
-                                                                    &tls_connector,
-                                                                    &write_half,
-                                                                    &session_id,
-                                                                    &config,
-                                                                    &msg2client_sender,
-                                                                    disconnect_tx.clone(),
-                                                                    is_resume,
-                                                                ).await;
-                                                            }
-                                                            continue;
-                                                        }
-                                                    }
-                                                } else {
-                                                    // No connection yet — try to establish one before retrying
-                                                    drop(w);
-                                                    let sid = *session_id.lock().await;
-                                                    let is_resume = sid.is_some();
-                                                    establish_connection(
-                                                        &tls_connector,
-                                                        &write_half,
-                                                        &session_id,
-                                                        &config,
-                                                        &msg2client_sender,
-                                                        disconnect_tx.clone(),
-                                                        is_resume,
-                                                    ).await;
-                                                    if attempt < 3 {
-                                                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                                                    }
-                                                }
-                                            }
-                                            if let Some(e) = last_err {
-                                                let _ = msg2client_sender.send(MessageToClient::CameraError(e));
-                                                let _ = disconnect_tx.send(()).await;
-                                            }
-                                        });
+                                        let compression_level = config.iter().filter(|c| c.compress).map(|c| c.compression_level).max().unwrap_or(1);
+                                        let item = PostProcessingItem {
+                                            conn: conn.clone(),
+                                            file_path,
+                                            compress,
+                                            compression_level,
+                                            enqueued_at: event_received_at,
+                                        };
+                                        if let Err(e) = queue_tx.send(item).await {
+                                            eprintln!("Post-processing queue full or closed: {:?}", e);
+                                        }
                                     }
                                 }
                             }
@@ -269,6 +241,109 @@ pub fn start_post_processing_worker(
     sender
 }
 
+/// Single task that drains the post-processing queue one image at a time,
+/// applying a ~30-second timeout per image upload.
+async fn post_processing_queue_worker(
+    mut queue_rx: tokio::sync::mpsc::Receiver<PostProcessingItem>,
+    write_half: Arc<Mutex<Option<tokio::io::WriteHalf<TlsStream<TcpStream>>>>>,
+    session_id: Arc<Mutex<Option<u64>>>,
+    msg2client_sender: tokio::sync::broadcast::Sender<MessageToClient>,
+    disconnect_tx: tokio::sync::mpsc::Sender<()>,
+    tls_connector: TlsConnector,
+) {
+    while let Some(item) = queue_rx.recv().await {
+        println!(
+            "[TIMING] +{:.1}ms — post-processing queue worker: processing item {}",
+            item.enqueued_at.elapsed().as_secs_f64() * 1000.0,
+            item.file_path.file
+        );
+
+        let mut last_err = None;
+        for attempt in 1..=3 {
+            println!(
+                "[TIMING] +{:.1}ms — attempt {}/3: acquiring write lock",
+                item.enqueued_at.elapsed().as_secs_f64() * 1000.0,
+                attempt
+            );
+            let mut w = write_half.lock().await;
+            println!(
+                "[TIMING] +{:.1}ms — attempt {}/3: lock acquired",
+                item.enqueued_at.elapsed().as_secs_f64() * 1000.0,
+                attempt
+            );
+
+            if let Some(ref mut writer) = *w {
+                println!(
+                    "[TIMING] +{:.1}ms — attempt {}/3: starting send_raw_to_server",
+                    item.enqueued_at.elapsed().as_secs_f64() * 1000.0,
+                    attempt
+                );
+                let send_fut = send_raw_to_server(writer, &item.conn, &item.file_path, item.compress, item.compression_level);
+                match tokio::time::timeout(POST_PROCESSING_TIMEOUT, send_fut).await {
+                    Ok(Ok(_)) => {
+                        println!(
+                            "[TIMING] +{:.1}ms — attempt {}/3: send_raw_to_server succeeded",
+                            item.enqueued_at.elapsed().as_secs_f64() * 1000.0,
+                            attempt
+                        );
+                        last_err = None;
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!("Error sending raw to post-processing server (attempt {}/3): {:?}", attempt, e);
+                        last_err = Some(e);
+                        *w = None;
+                        drop(w);
+                    }
+                    Err(_elapsed) => {
+                        eprintln!("Timeout sending raw to post-processing server (attempt {}/3)", attempt);
+                        last_err = Some(CameraError::RsRawUtilError("Upload timed out after 30s".to_string()));
+                        *w = None;
+                        drop(w);
+                    }
+                }
+            } else {
+                // No connection — try to establish one before retrying
+                drop(w);
+                let sid = *session_id.lock().await;
+                let is_resume = sid.is_some();
+                establish_connection(
+                    &tls_connector,
+                    &write_half,
+                    &session_id,
+                    &[],
+                    &msg2client_sender,
+                    disconnect_tx.clone(),
+                    is_resume,
+                ).await;
+            }
+
+            if attempt < 3 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                // Re-establish connection after a send failure
+                if write_half.lock().await.is_none() {
+                    let sid = *session_id.lock().await;
+                    let is_resume = sid.is_some();
+                    establish_connection(
+                        &tls_connector,
+                        &write_half,
+                        &session_id,
+                        &[],
+                        &msg2client_sender,
+                        disconnect_tx.clone(),
+                        is_resume,
+                    ).await;
+                }
+            }
+        }
+
+        if let Some(e) = last_err {
+            let _ = msg2client_sender.send(MessageToClient::CameraError(e));
+            let _ = disconnect_tx.send(()).await;
+        }
+    }
+}
+
 /// Establishes a TLS connection, sends StartSession or ResumeSession, sends current config,
 /// spawns a response reader. Returns true on success.
 async fn establish_connection(
@@ -303,7 +378,7 @@ async fn establish_connection(
                         return false;
                     }
                     // Send current config
-                    if let Err(e) = send_framed(writer, &MessageToPostProcessor::SetPostProcessorConfig(config.to_vec())).await {
+                    if let Err(e) = send_framed(writer, &MessageToPostProcessor::SetPostProcessorConfig(config.iter().cloned().map(Into::into).collect())).await {
                         eprintln!("Failed to send initial config to post-processing server: {:?}", e);
                     }
                 }
@@ -425,6 +500,7 @@ where
     let len = bytes.len() as u32;
     stream.write_all(&len.to_be_bytes()).await?;
     stream.write_all(&bytes).await?;
+    stream.flush().await?;
     Ok(())
 }
 
@@ -445,6 +521,7 @@ async fn send_raw_to_server(
     connection: &CameraConnection,
     image_path: &CameraFilePath,
     compress: bool,
+    compression_level: u8,
 ) -> Result<(), CameraError> {
     let t0 = std::time::Instant::now();
     let img = connection.camera.fs().download(&image_path.folder, &image_path.file).await?;
@@ -455,7 +532,7 @@ async fn send_raw_to_server(
     let msg = if compress {
         let t_compress = std::time::Instant::now();
         // zstd level 1: fastest, good ratio, suitable for Raspberry Pi Zero 2
-        let compressed = zstd::encode_all(img_data.as_ref(), 1)
+        let compressed = zstd::encode_all(img_data.as_ref(), compression_level as i32)
             .map_err(|e| CameraError::RsRawUtilError(format!("Compression failed: {e}")))?;
         println!("[TIMING] send_raw_to_server: zstd compression done in {:.1}ms ({} -> {} bytes, {:.1}% of original)",
             t_compress.elapsed().as_secs_f64() * 1000.0, img_data.len(), compressed.len(),

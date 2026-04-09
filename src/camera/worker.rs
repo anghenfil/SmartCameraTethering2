@@ -365,7 +365,7 @@ async fn handle_msg(
     sender_to_event_loop: tokio::sync::broadcast::Sender<Option<CameraConnection>>,
     cancel_channel_sender: tokio::sync::broadcast::Sender<()>,
     event_channel: tokio::sync::broadcast::Sender<Arc<CameraEvent>>,
-    pp_worker_sender: tokio::sync::mpsc::Sender<Vec<SmartCameraTethering2_shared_types::PostProcessingConfig>>,
+    pp_worker_sender: tokio::sync::mpsc::Sender<Vec<crate::websocket::scheme::PostProcessingConfig>>,
     state: AppState,
 ) -> Result<(), CameraError> {
     println!("Handling websocket2app message: {:?}", msg);

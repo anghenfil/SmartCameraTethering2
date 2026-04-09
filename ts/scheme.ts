@@ -72,6 +72,7 @@ export interface PostProcessingConfig {
     steps: PostProcessingStep[];
     trigger_every_n_images: number;
     compress: boolean;
+    compression_level: number;
 }
 
 export type MessageToServer =

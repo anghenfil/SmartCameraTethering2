@@ -339,9 +339,13 @@ function add_post_processing_config_ui(config?: PostProcessingConfig) {
                 <span class="input-group-text">Trigger Every N Images</span>
                 <input type="number" class="form-control trigger-every" min="1" value="${config?.trigger_every_n_images || 1}">
             </div>
-            <div class="form-check mb-3">
+            <div class="form-check mb-2">
                 <input class="form-check-input compress-raw" type="checkbox" ${config?.compress ? 'checked' : ''}>
                 <label class="form-check-label">Compress RAW before sending (zstd)</label>
+            </div>
+            <div class="input-group mb-3 compression-level-group" ${config?.compress ? '' : 'style="display:none"'}>
+                <span class="input-group-text">Compression Level (1–22)</span>
+                <input type="number" class="form-control compression-level" min="1" max="22" value="${config?.compression_level ?? 1}">
             </div>
             <h6>Steps</h6>
             <div class="steps-container"></div>
@@ -363,7 +367,14 @@ function add_post_processing_config_ui(config?: PostProcessingConfig) {
     triggerInput.addEventListener("input", apply_post_processing);
 
     const compressInput = configDiv.querySelector(".compress-raw") as HTMLInputElement;
-    compressInput.addEventListener("change", apply_post_processing);
+    const levelGroup = configDiv.querySelector(".compression-level-group") as HTMLElement;
+    const levelInput = configDiv.querySelector(".compression-level") as HTMLInputElement;
+    compressInput.addEventListener("change", () => {
+        levelGroup.style.display = compressInput.checked ? '' : 'none';
+        apply_post_processing();
+    });
+    levelInput.addEventListener("change", apply_post_processing);
+    levelInput.addEventListener("input", apply_post_processing);
 
     if (config) {
         config.steps.forEach(step => add_step_ui(configDiv.querySelector(".steps-container")!, step));
@@ -560,10 +571,12 @@ function apply_post_processing() {
         });
 
         const compress = (configDiv.querySelector(".compress-raw") as HTMLInputElement).checked;
+        const compression_level = parseInt((configDiv.querySelector(".compression-level") as HTMLInputElement).value) || 1;
         configs.push({
             trigger_every_n_images: triggerEvery,
             steps: steps,
-            compress: compress
+            compress: compress,
+            compression_level: compression_level
         });
     });
 
