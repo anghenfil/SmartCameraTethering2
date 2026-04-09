@@ -57,7 +57,7 @@ impl From<std::io::Error> for CameraError {
 }
 
 pub fn start_camera_event_loop(
-    receiver: tokio::sync::broadcast::Receiver<CameraConnection>,
+    receiver: tokio::sync::broadcast::Receiver<Option<CameraConnection>>,
 ) -> tokio::sync::broadcast::Sender<Arc<CameraEvent>> {
     let mut receiver = receiver;
 
@@ -65,37 +65,51 @@ pub fn start_camera_event_loop(
 
     let sender = sender_orig.clone();
     tokio::spawn(async move {
-        let mut connection = match receiver.recv().await {
-            Ok(conn) => conn,
-            Err(e) => {
-                println!("Channel to camera event loop closed {e}.");
-                return;
-            }
-        };
+        let mut connection: Option<CameraConnection> = None;
 
         loop {
-            tokio::select! {
-                new_conn = receiver.recv() => {
-                    if let Ok(new_conn) = new_conn{
-                        connection = new_conn;
-                    }else{
-                        println!("Channel to camera event loop closed.");
-                        break
+            match &mut connection {
+                None => {
+                    // No active connection — wait for one
+                    match receiver.recv().await {
+                        Ok(Some(conn)) => connection = Some(conn),
+                        Ok(None) => {}, // another disconnect signal, stay idle
+                        Err(e) => {
+                            println!("Channel to camera event loop closed {e}.");
+                            return;
+                        }
                     }
-                },
-                event = connection.camera.wait_event(Duration::from_millis(100)) => {
-                    match event{
-                        Ok(event) => {
-                            match event{
-                                CameraEvent::Timeout => {},
-                                _ => {
-                                    let _ = sender.send(Arc::new(event));
+                }
+                Some(conn) => {
+                    tokio::select! {
+                        new_conn = receiver.recv() => {
+                            match new_conn {
+                                Ok(Some(new_conn)) => connection = Some(new_conn),
+                                Ok(None) => {
+                                    // Disconnect signal — stop polling
+                                    connection = None;
+                                }
+                                Err(_) => {
+                                    println!("Channel to camera event loop closed.");
+                                    return;
                                 }
                             }
                         },
-                        Err(e) => {
-                            println!("Error receiving camera event: {:?}", e);
-                            tokio::time::sleep(Duration::from_millis(1000)).await;
+                        event = conn.camera.wait_event(Duration::from_millis(100)) => {
+                            match event {
+                                Ok(event) => {
+                                    match event {
+                                        CameraEvent::Timeout => {},
+                                        _ => {
+                                            let _ = sender.send(Arc::new(event));
+                                        }
+                                    }
+                                },
+                                Err(e) => {
+                                    println!("Error receiving camera event: {:?}", e);
+                                    tokio::time::sleep(Duration::from_millis(1000)).await;
+                                }
+                            }
                         }
                     }
                 }
@@ -142,7 +156,7 @@ pub fn start_worker(state: AppState, mut receiver: tokio::sync::mpsc::Receiver<M
     let mut last_port: Option<String> = None;
     let mut last_model: Option<String> = None;
 
-    let (sender_to_workers, recv) = tokio::sync::broadcast::channel::<CameraConnection>(1);
+    let (sender_to_workers, recv) = tokio::sync::broadcast::channel::<Option<CameraConnection>>(1);
     let event_channel = start_camera_event_loop(recv);
 
     let (cancel_channel_sender, _) = tokio::sync::broadcast::channel::<()>(1);
@@ -184,7 +198,7 @@ pub fn start_worker(state: AppState, mut receiver: tokio::sync::mpsc::Receiver<M
                             };
                             match connect_result {
                                 Ok(conn) => {
-                                    let _ = sender_to_workers.send(conn.clone());
+                                    let _ = sender_to_workers.send(Some(conn.clone()));
                                     connection = Some(conn);
 
                                     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -194,6 +208,7 @@ pub fn start_worker(state: AppState, mut receiver: tokio::sync::mpsc::Receiver<M
                                         loop {
                                             match get_camera_status(conn).await {
                                                 Ok(status) => {
+                                                    *state.last_camera_status.lock().unwrap() = status.clone();
                                                     let _ = sender.send(MessageToClient::CameraStatus(status));
                                                     break;
                                                 }
@@ -236,7 +251,7 @@ pub fn start_worker(state: AppState, mut receiver: tokio::sync::mpsc::Receiver<M
                                 .await
                                 {
                                     Ok(new_con) => {
-                                        let _ = sender_to_workers.send(new_con.clone());
+                                        let _ = sender_to_workers.send(Some(new_con.clone()));
                                         connection = Some(new_con);
                                     }
                                     Err(e) => {
@@ -256,6 +271,33 @@ pub fn start_worker(state: AppState, mut receiver: tokio::sync::mpsc::Receiver<M
                             break;
                         }
                     };
+                    // DisconnectCamera: release connection and notify UI
+                    if let MessageToServer::DisconnectCamera = &msg {
+                        connection = None;
+                        let _ = sender_to_workers.send(None);
+                        // Give the OS time to release the USB device before allowing reconnect
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                        let disconnected = CameraStatus::default();
+                        *state.last_camera_status.lock().unwrap() = disconnected.clone();
+                        let _ = sender.send(MessageToClient::CameraStatus(disconnected));
+                        continue;
+                    }
+
+                    // GetCameraStatus should never trigger disconnect — fall back to cache on failure
+                    if let MessageToServer::GetCameraStatus = &msg {
+                        match connection::get_camera_status(conn).await {
+                            Ok(status) => {
+                                *state.last_camera_status.lock().unwrap() = status.clone();
+                                let _ = sender.send(MessageToClient::CameraStatus(status));
+                            }
+                            Err(_) => {
+                                let cached = state.last_camera_status.lock().unwrap().clone();
+                                let _ = sender.send(MessageToClient::CameraStatus(cached));
+                            }
+                        }
+                        continue;
+                    }
+
                     let mut res = Ok(());
                     let mut retries = 0;
                     while retries < 3 {
@@ -267,6 +309,7 @@ pub fn start_worker(state: AppState, mut receiver: tokio::sync::mpsc::Receiver<M
                             cancel_channel_sender.clone(),
                             event_channel.clone(),
                             pp_worker_sender.clone(),
+                            state.clone(),
                         )
                         .await
                         {
@@ -276,23 +319,24 @@ pub fn start_worker(state: AppState, mut receiver: tokio::sync::mpsc::Receiver<M
                             }
                             Err(e) => {
                                 println!(
-                                    "Got camera error {:?}. Trying to reconnect to camera and trying again.",
-                                    e
+                                    "Got camera error {:?}. Retrying ({}/3).",
+                                    e, retries + 1
                                 );
                                 res = Err(e);
                                 retries += 1;
-
-                                if let Ok(new_con) =
-                                    connection::connect(ConnectToCamera::default()).await
-                                {
-                                    let _ = sender_to_workers.send(new_con.clone());
-                                    *conn = new_con;
-                                }
+                                tokio::time::sleep(Duration::from_millis(500)).await;
                             }
                         }
                     }
                     if let Err(e) = res {
                         let _ = sender.send(MessageToClient::CameraError(e));
+                        // Release the USB device and give OS time before allowing reconnect
+                        connection = None;
+                        let _ = sender_to_workers.send(None);
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                        let disconnected = CameraStatus::default();
+                        *state.last_camera_status.lock().unwrap() = disconnected.clone();
+                        let _ = sender.send(MessageToClient::CameraStatus(disconnected));
                     }
                 }
             }
@@ -318,10 +362,11 @@ async fn handle_msg(
     msg: &MessageToServer,
     connection: &mut CameraConnection,
     sender: Sender<MessageToClient>,
-    sender_to_event_loop: tokio::sync::broadcast::Sender<CameraConnection>,
+    sender_to_event_loop: tokio::sync::broadcast::Sender<Option<CameraConnection>>,
     cancel_channel_sender: tokio::sync::broadcast::Sender<()>,
     event_channel: tokio::sync::broadcast::Sender<Arc<CameraEvent>>,
     pp_worker_sender: tokio::sync::mpsc::Sender<Vec<SmartCameraTethering2_shared_types::PostProcessingConfig>>,
+    state: AppState,
 ) -> Result<(), CameraError> {
     println!("Handling websocket2app message: {:?}", msg);
     match msg {
@@ -333,7 +378,7 @@ async fn handle_msg(
         }
         MessageToServer::ConnectToCamera(settings) => {
             let new_connection = connection::connect(settings.clone()).await?;
-            let _ = sender_to_event_loop.send(new_connection.clone());
+            let _ = sender_to_event_loop.send(Some(new_connection.clone()));
             *connection = new_connection;
 
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -342,6 +387,7 @@ async fn handle_msg(
             loop {
                 match get_camera_status(connection).await {
                     Ok(status) => {
+                        *state.last_camera_status.lock().unwrap() = status.clone();
                         let _ = sender.send(MessageToClient::CameraStatus(status));
                         break;
                     }
@@ -394,6 +440,9 @@ async fn handle_msg(
             let _ = std::process::Command::new("sudo")
                 .args(&["shutdown", "-h", "now"])
                 .spawn();
+        }
+        MessageToServer::DisconnectCamera => {
+            // Handled before retry loop in start_worker
         }
     }
     Ok(())

@@ -18,6 +18,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 }
 
 async fn socket_writer(mut sender: SplitSink<WebSocket, Message>, state: AppState) {
+    // Immediately send the last known camera status to the new client (no race condition)
+    let last_status = state.last_camera_status.lock().unwrap().clone();
+    let _ = MessageToClient::CameraStatus(last_status).send(&mut sender).await;
+
     let mut receiver = state.app2websocket.subscribe();
 
     while let Ok(msg) = receiver.recv().await {

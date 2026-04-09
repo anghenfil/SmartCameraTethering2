@@ -36,7 +36,7 @@ impl From<&gphoto2::file::CameraFilePath> for CameraFilePath {
 
 pub fn start_post_processing_worker(
     event_channel: tokio::sync::broadcast::Sender<Arc<CameraEvent>>,
-    mut connection_channel: tokio::sync::broadcast::Receiver<CameraConnection>,
+    mut connection_channel: tokio::sync::broadcast::Receiver<Option<CameraConnection>>,
     msg2client_sender: tokio::sync::broadcast::Sender<MessageToClient>,
 ) -> tokio::sync::mpsc::Sender<Vec<PostProcessingConfig>> {
     let (sender, mut recv) = tokio::sync::mpsc::channel::<Vec<PostProcessingConfig>>(3);
@@ -217,7 +217,7 @@ pub fn start_post_processing_worker(
                 },
                 new_connection = connection_channel.recv() => {
                     match new_connection {
-                        Ok(new_connection) => {
+                        Ok(Some(new_connection)) => {
                             connection = Some(new_connection);
                             // Establish a fresh TLS connection (StartSession — new camera connection)
                             *session_id.lock().await = None;
@@ -231,6 +231,7 @@ pub fn start_post_processing_worker(
                                 false,
                             ).await;
                         }
+                        Ok(None) => {}
                         Err(e) => {
                             eprintln!("Channel to post processing worker closed. {e}");
                         }

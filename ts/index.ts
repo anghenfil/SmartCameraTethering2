@@ -40,8 +40,12 @@ document.addEventListener("DOMContentLoaded", async function(event) {
             console.log("Available cameras:", msg.CameraList.cameras);
             update_available_cameras(msg.CameraList);
         } else if('CameraStatus' in msg){
+            const was_connected = camera_connected;
             camera_connected = msg.CameraStatus.connected;
             show_camera_status(msg.CameraStatus);
+            if (!camera_connected) {
+                query_available_cameras();
+            }
         } else if('CameraConfig' in msg){
             if(!deepEqual(msg.CameraConfig.values, camera_config?.values)){
                 console.log("Camera config changed:", msg.CameraConfig);
@@ -83,11 +87,10 @@ document.addEventListener("DOMContentLoaded", async function(event) {
         await WebSocketClient.connect();
         console.log("Connected!");
 
+        // socket_writer will push cached status immediately on connect,
+        // but also send explicitly as a fallback
         console.log("Requesting camera status...");
         WebSocketClient.send("GetCameraStatus");
-        const getCamerasMsg: MessageToServer = "GetDetectedCameras";
-        console.log("Requesting camera list...");
-        WebSocketClient.send(getCamerasMsg);
     } catch (e) {
         console.error("Failed to connect:", e);
     }
@@ -98,29 +101,44 @@ document.addEventListener("DOMContentLoaded", async function(event) {
     // Load post-processing config from storage
     load_post_processing_from_storage();
 
-    // If not connected, list available cameras every few seconds
-    query_available_cameras();
+    // Periodically query camera status every 5 seconds
+    query_camera_status();
 
-    // If connected, query camera settings every 1 second
+    // If connected, query camera settings every 2 seconds
     query_settings();
 });
 
+// Tracks whether camera list polling interval is active
+let camera_list_interval: ReturnType<typeof setInterval> | undefined;
+
 function query_available_cameras(){
-    if (!camera_connected){
-        WebSocketClient.send("GetDetectedCameras");
-        let interval = setInterval(() => {
-            if (camera_connected){
-                clearInterval(interval);
-                return;
-            }
-            WebSocketClient.send("GetDetectedCameras");
-        }, 3000
-        )
+    if (camera_connected) return; // Already connected, don't poll
+
+    // Clear any existing interval to avoid duplicates
+    if (camera_list_interval !== undefined) {
+        clearInterval(camera_list_interval);
+        camera_list_interval = undefined;
     }
+
+    WebSocketClient.send("GetDetectedCameras");
+    camera_list_interval = setInterval(() => {
+        if (camera_connected){
+            clearInterval(camera_list_interval);
+            camera_list_interval = undefined;
+            return;
+        }
+        WebSocketClient.send("GetDetectedCameras");
+    }, 3000);
+}
+
+function query_camera_status(){
+    setInterval(() => {
+        WebSocketClient.send("GetCameraStatus");
+    }, 5000);
 }
 
 function query_settings(){
-    let interval = setInterval(() => {
+    setInterval(() => {
         if (camera_connected && !is_capturing){
             WebSocketClient.send("GetCameraConfig");
         }

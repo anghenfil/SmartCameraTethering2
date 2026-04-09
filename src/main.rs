@@ -22,6 +22,7 @@ async fn main() {
         app2websocket: tokio::sync::broadcast::Sender::new(10),
         websocket2app: websocket2app_tx,
         event_loop_paused: Arc::new(AtomicBool::new(false)),
+        last_camera_status: Arc::new(std::sync::Mutex::new(crate::websocket::scheme::CameraStatus::default())),
     };
 
     let storage_cpy = storage.clone();

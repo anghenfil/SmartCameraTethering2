@@ -84,7 +84,8 @@ export type MessageToServer =
     | "CapturePreviewImage"
     | "CancelCapture"
     | { SetPostProcessingConfigs: PostProcessingConfig[] }
-    | "Shutdown";
+    | "Shutdown"
+    | "DisconnectCamera";
 
 export interface AvailableFolderOperations {
     delete_all: boolean;

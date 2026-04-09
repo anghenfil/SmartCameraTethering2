@@ -103,6 +103,7 @@ pub enum MessageToServer {
     CancelCapture,
     SetPostProcessingConfigs(Vec<PostProcessingConfig>),
     Shutdown,
+    DisconnectCamera,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

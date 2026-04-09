@@ -24,6 +24,9 @@ export function update_available_cameras(list: CameraList){
 
 export function add_interface_event_listeners(){
     document.getElementById("connect")?.addEventListener("click", connect_to_camera);
+    document.getElementById("disconnect")?.addEventListener("click", () => {
+        WebSocketClient.send("DisconnectCamera");
+    });
     document.getElementById("startPreview")?.addEventListener("click", start_preview);
     document.getElementById("stopPreview")?.addEventListener("click", stop_preview);
     document.getElementById("shutdown")?.addEventListener("click", () => {
