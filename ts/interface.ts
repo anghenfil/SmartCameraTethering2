@@ -26,6 +26,11 @@ export function add_interface_event_listeners(){
     document.getElementById("connect")?.addEventListener("click", connect_to_camera);
     document.getElementById("startPreview")?.addEventListener("click", start_preview);
     document.getElementById("stopPreview")?.addEventListener("click", stop_preview);
+    document.getElementById("shutdown")?.addEventListener("click", () => {
+        if (confirm("Are you sure you want to shutdown the Raspberry Pi?")) {
+            WebSocketClient.send("Shutdown");
+        }
+    });
     add_capture_listener();
     add_cancel_capture_listener();
     add_post_processing_listeners();
@@ -90,14 +95,63 @@ function stop_preview(){
     clearInterval(preview_interval);
 }
 
+const MAX_IMAGES = 3;
+let image_buffer: { url: string; source: string }[] = [];
+let image_index: number = 0;
+
+function source_label(source: string): string {
+    if (source === "Preview") return "Preview";
+    if (source === "Capture") return "Capture";
+    if (source === "PostProcessing") return "Post-Processing";
+    return source;
+}
+
+function render_current_image() {
+    const img = document.getElementById("image") as HTMLImageElement;
+    const sourceLabel = document.getElementById("imageSource") as HTMLSpanElement;
+    const prevBtn = document.getElementById("imagePrev") as HTMLButtonElement;
+    const nextBtn = document.getElementById("imageNext") as HTMLButtonElement;
+
+    if (image_buffer.length === 0) return;
+
+    const entry = image_buffer[image_index];
+    img.src = entry.url;
+    sourceLabel.textContent = `${source_label(entry.source)} (${image_index + 1}/${image_buffer.length})`;
+    prevBtn.disabled = image_index <= 0;
+    nextBtn.disabled = image_index >= image_buffer.length - 1;
+}
+
+function setup_image_nav_listeners() {
+    const prevBtn = document.getElementById("imagePrev") as HTMLButtonElement;
+    const nextBtn = document.getElementById("imageNext") as HTMLButtonElement;
+    prevBtn.addEventListener("click", () => {
+        if (image_index > 0) {
+            image_index--;
+            render_current_image();
+        }
+    });
+    nextBtn.addEventListener("click", () => {
+        if (image_index < image_buffer.length - 1) {
+            image_index++;
+            render_current_image();
+        }
+    });
+}
+setup_image_nav_listeners();
+
 export function show_image(image: Image){
-    let blob = new Blob([image.data.buffer as ArrayBuffer], {type: image.mime_type});
-    let url = URL.createObjectURL(blob);
-    let img = document.getElementById("image") as HTMLImageElement;
-    if (img.src) {
-        URL.revokeObjectURL(img.src);
+    console.log("Showing image.");
+    const blob = new Blob([image.data.buffer as ArrayBuffer], {type: image.mime_type});
+    const url = URL.createObjectURL(blob);
+
+    if (image_buffer.length === MAX_IMAGES) {
+        URL.revokeObjectURL(image_buffer[0].url);
+        image_buffer.shift();
     }
-    img.src = url;
+    image_buffer.push({ url, source: image.source as string });
+    image_index = image_buffer.length - 1;
+
+    render_current_image();
 }
 
 export function show_camera_config(config: CameraConfig){
@@ -266,7 +320,6 @@ function add_post_processing_listeners() {
         add_post_processing_config_ui();
         apply_post_processing();
     });
-    document.getElementById("set_default_post_processing")?.addEventListener("click", set_default_post_processing);
 }
 
 function add_post_processing_config_ui(config?: PostProcessingConfig) {
@@ -322,7 +375,6 @@ function add_step_ui(container: Element, step?: PostProcessingStep) {
             if (step === "Return") stepType = "Return";
         } else {
             if ("Blend" in step) stepType = "Blend";
-            else if ("Convert" in step) stepType = "Convert";
             else if ("Save" in step) stepType = "Save";
             else if ("Upload" in step) stepType = "Upload";
         }
@@ -335,7 +387,6 @@ function add_step_ui(container: Element, step?: PostProcessingStep) {
                     <option value="Return" ${stepType === "Return" ? "selected" : ""}>Return</option>
                     <option value="Save" ${stepType === "Save" ? "selected" : ""}>Save</option>
                     <option value="Blend" ${stepType === "Blend" ? "selected" : ""}>Blend</option>
-                    <option value="Convert" ${stepType === "Convert" ? "selected" : ""}>Convert</option>
                     <option value="Upload" ${stepType === "Upload" ? "selected" : ""}>Upload</option>
                 </select>
                 <button class="btn btn-sm btn-outline-danger remove-step">×</button>
@@ -366,47 +417,40 @@ function update_step_details(container: HTMLElement, type: string, step?: PostPr
         container.innerHTML = `
             <div class="text-muted small">Always returns JPEG</div>
         `;
-    } else if (type === "Convert") {
-        container.innerHTML = `
-            <div class="mb-1 small">Target Formats:</div>
-            <div class="form-check form-check-inline">
-                <input class="form-check-input output-format-check" type="checkbox" value="JPEG" id="convert_jpeg">
-                <label class="form-check-label" for="convert_jpeg">JPEG</label>
-            </div>
-            <div class="form-check form-check-inline">
-                <input class="form-check-input output-format-check" type="checkbox" value="PNG" id="convert_png">
-                <label class="form-check-label" for="convert_png">PNG</label>
-            </div>
-            <div class="form-check form-check-inline">
-                <input class="form-check-input output-format-check" type="checkbox" value="TIFF" id="convert_tiff">
-                <label class="form-check-label" for="convert_tiff">TIFF</label>
-            </div>
-            <div class="form-check form-check-inline">
-                <input class="form-check-input output-format-check" type="checkbox" value="RAW" id="convert_raw">
-                <label class="form-check-label" for="convert_raw">RAW</label>
-            </div>
-        `;
-        if (step && typeof step !== "string" && "Convert" in step) {
-            step.Convert.output_formats.forEach(f => {
-                const check = container.querySelector(`input[value="${f}"]`) as HTMLInputElement;
-                if (check) check.checked = true;
-            });
-        }
-        container.querySelectorAll(".output-format-check").forEach(el => el.addEventListener("change", apply_post_processing));
     } else if (type === "Save") {
         container.innerHTML = `
-            <div class="input-group input-group-sm">
+            <div class="input-group input-group-sm mb-1">
                 <span class="input-group-text">Dest</span>
                 <select class="form-select output-destination">
                     <option value="SystemStorage">System Storage</option>
                     <option value="Camera">Camera</option>
+                    <option value="ServerStorage">Server Storage</option>
                 </select>
             </div>
+            <div class="input-group input-group-sm server-storage-path-group" style="display:none">
+                <span class="input-group-text">Path</span>
+                <input type="text" class="form-control server-storage-path" placeholder="subdir/name">
+            </div>
         `;
+        const destSelect = container.querySelector(".output-destination") as HTMLSelectElement;
+        const pathGroup = container.querySelector(".server-storage-path-group") as HTMLElement;
+        const pathInput = container.querySelector(".server-storage-path") as HTMLInputElement;
+        const togglePathGroup = () => {
+            pathGroup.style.display = destSelect.value === "ServerStorage" ? "" : "none";
+        };
         if (step && typeof step !== "string" && "Save" in step) {
-            (container.querySelector(".output-destination") as HTMLSelectElement).value = step.Save.output_destination;
+            const dest = step.Save.output_destination;
+            if (typeof dest === "object" && "ServerStorage" in dest) {
+                destSelect.value = "ServerStorage";
+                pathInput.value = dest.ServerStorage;
+            } else {
+                destSelect.value = dest as string;
+            }
         }
-        container.querySelector(".output-destination")?.addEventListener("change", apply_post_processing);
+        togglePathGroup();
+        destSelect.addEventListener("change", () => { togglePathGroup(); apply_post_processing(); });
+        pathInput.addEventListener("change", apply_post_processing);
+        pathInput.addEventListener("input", apply_post_processing);
     } else if (type === "Blend") {
         container.innerHTML = `
             <div class="input-group input-group-sm mb-1">
@@ -473,14 +517,15 @@ function apply_post_processing() {
             const type = (stepDiv.querySelector(".step-type") as HTMLSelectElement).value;
             if (type === "Return") {
                 steps.push("Return");
-            } else if (type === "Convert") {
-                const formats: any[] = [];
-                stepDiv.querySelectorAll(".output-format-check:checked").forEach(el => {
-                    formats.push((el as HTMLInputElement).value);
-                });
-                steps.push({ Convert: { output_formats: formats } });
             } else if (type === "Save") {
-                const dest = (stepDiv.querySelector(".output-destination") as HTMLSelectElement).value as any;
+                const destVal = (stepDiv.querySelector(".output-destination") as HTMLSelectElement).value;
+                let dest: any;
+                if (destVal === "ServerStorage") {
+                    const path = (stepDiv.querySelector(".server-storage-path") as HTMLInputElement).value || "";
+                    dest = { ServerStorage: path };
+                } else {
+                    dest = destVal;
+                }
                 steps.push({ Save: { output_destination: dest } });
             } else if (type === "Blend") {
                 const num = parseInt((stepDiv.querySelector(".blend-num") as HTMLInputElement).value);
@@ -529,21 +574,6 @@ export function load_post_processing_from_storage(): boolean {
         }
     }
     return false;
-}
-
-export function set_default_post_processing() {
-    const container = document.getElementById("post_processing_configs") as HTMLElement;
-    container.innerHTML = "";
-    
-    const defaultConfig: PostProcessingConfig = {
-        trigger_every_n_images: 1,
-        steps: [
-            "Return"
-        ]
-    };
-
-    add_post_processing_config_ui(defaultConfig);
-    WebSocketClient.send({ SetPostProcessingConfigs: [defaultConfig] });
 }
 
 export let alert_hider: NodeJS.Timeout | undefined;

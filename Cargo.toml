@@ -7,12 +7,20 @@ edition = "2024"
 axum = { version = "0.8", features = ["ws"] }
 rsraw = "0.1.1"
 rsraw-utils = {git = "https://github.com/anghenfil/rsraw-utils.git"}
+SmartCameraTethering2-shared-types  = {git = "https://github.com/anghenfil/SmartCameraTethering2-shared-types.git"}
 image = "0.25"
 tokio = {version = "1", features = ["full"]}
 gphoto2 = "3.4.1"
 serde = { version = "1.0.228", features = ["derive"] }
-reqwest = { version = "0.13", features = ["json", "stream"] }
+tokio-rustls = "0.26"
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
+rkyv = { version = "0.7.43", features = ["validation"] }
+bytecheck = "0.6.11"
 tower-http = {version = "0.6.8", features = ["fs"]}
 futures-util = "0.3.32"
 serde_json = "1"
 uuid = {version = "1.22", features = ["v4"]}
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"

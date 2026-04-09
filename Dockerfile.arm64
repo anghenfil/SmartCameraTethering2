@@ -1,0 +1,15 @@
+FROM --platform=linux/arm64 rust:bookworm
+
+RUN apt-get update && apt-get install -y \
+    libgphoto2-dev \
+    libusb-1.0-0-dev \
+    libexif-dev \
+    pkg-config \
+    clang \
+    libclang-dev \
+    curl \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /project

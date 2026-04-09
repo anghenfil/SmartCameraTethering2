@@ -111,7 +111,9 @@ async fn socket_reader(mut receiver: SplitStream<WebSocket>, state: AppState) {
                         continue;
                     }
                 };
-                sender.send(msg).expect("Failed to send message to app");
+                if let Err(e) = sender.send(msg).await {
+                    eprintln!("Failed to send message to app: {:?}", e);
+                }
             }
         }
     }

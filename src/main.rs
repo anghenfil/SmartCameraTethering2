@@ -13,14 +13,19 @@ pub mod websocket;
 
 #[tokio::main]
 async fn main() {
+    rustls::crypto::ring::default_provider().install_default()
+        .expect("Failed to install rustls crypto provider");
+
+    let (websocket2app_tx, websocket2app_rx) = tokio::sync::mpsc::channel::<crate::websocket::scheme::MessageToServer>(32);
+
     let storage = AppState {
         app2websocket: tokio::sync::broadcast::Sender::new(10),
-        websocket2app: tokio::sync::broadcast::Sender::new(10),
+        websocket2app: websocket2app_tx,
         event_loop_paused: Arc::new(AtomicBool::new(false)),
     };
 
     let storage_cpy = storage.clone();
-    start_worker(storage_cpy.clone());
+    start_worker(storage_cpy.clone(), websocket2app_rx);
 
     let app = Router::new()
         .route("/ws", any(websocket::connection::handler))

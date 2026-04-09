@@ -2,7 +2,7 @@ import * as WebSocketClient from './websocket';
 import {CameraConfig, MessageToServer, WebSocketMessage} from './scheme';
 import {
     add_interface_event_listeners, show_camera_status, update_available_cameras, show_image, show_camera_config,
-    show_alert, update_capture_button_state, set_default_post_processing, load_post_processing_from_storage
+    show_alert, update_capture_button_state, load_post_processing_from_storage
 } from './interface';
 import deepEqual from "deep-equal";
 
@@ -83,6 +83,8 @@ document.addEventListener("DOMContentLoaded", async function(event) {
         await WebSocketClient.connect();
         console.log("Connected!");
 
+        console.log("Requesting camera status...");
+        WebSocketClient.send("GetCameraStatus");
         const getCamerasMsg: MessageToServer = "GetDetectedCameras";
         console.log("Requesting camera list...");
         WebSocketClient.send(getCamerasMsg);
@@ -93,10 +95,8 @@ document.addEventListener("DOMContentLoaded", async function(event) {
     // Add interface event listeners
     add_interface_event_listeners();
 
-    // Load post-processing config from storage or set default
-    if (!load_post_processing_from_storage()) {
-        set_default_post_processing();
-    }
+    // Load post-processing config from storage
+    load_post_processing_from_storage();
 
     // If not connected, list available cameras every few seconds
     query_available_cameras();

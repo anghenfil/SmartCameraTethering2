@@ -135,8 +135,7 @@ pub async fn wait_for_event(
     }
 }
 
-pub fn start_worker(state: AppState) {
-    let mut receiver = state.websocket2app.subscribe();
+pub fn start_worker(state: AppState, mut receiver: tokio::sync::mpsc::Receiver<MessageToServer>) {
     let sender = state.app2websocket.clone();
 
     let mut connection: Option<CameraConnection> = None;
@@ -160,10 +159,10 @@ pub fn start_worker(state: AppState) {
                 // no connection established yet, reduced mode
                 None => {
                     let msg = match receiver.recv().await {
-                        Ok(msg) => msg,
-                        Err(e) => {
-                            eprintln!("Error getting websocket2app message: {}", e);
-                            continue;
+                        Some(msg) => msg,
+                        None => {
+                            eprintln!("websocket2app channel closed.");
+                            break;
                         }
                     };
                     println!("Received websocket2app message: {:?}", msg);
@@ -178,30 +177,37 @@ pub fn start_worker(state: AppState) {
                         MessageToServer::ConnectToCamera(cfg) => {
                             last_port = cfg.port.clone();
                             last_model = cfg.model.clone();
-                            if let (Some(port), Some(model)) = (&last_port, &last_model) {
-                                match connect_to_camera(port, model).await {
-                                    Ok(conn) => {
-                                        let _ = sender_to_workers.send(conn.clone());
-                                        connection = Some(conn);
-                                    }
-                                    Err(e) => {
-                                        let _ = sender.send(MessageToClient::CameraError(e));
-                                    }
-                                }
+                            let connect_result = if let (Some(port), Some(model)) = (&last_port, &last_model) {
+                                connect_to_camera(port, model).await
                             } else {
-                                match connection::autoconnect_camera().await {
-                                    Ok(conn) => {
-                                        let _ = sender_to_workers.send(conn.clone());
-                                        connection = Some(conn);
+                                connection::autoconnect_camera().await
+                            };
+                            match connect_result {
+                                Ok(conn) => {
+                                    let _ = sender_to_workers.send(conn.clone());
+                                    connection = Some(conn);
+
+                                    tokio::time::sleep(Duration::from_millis(500)).await;
+
+                                    if let Some(conn) = connection.as_mut() {
+                                        let mut retries = 0u64;
+                                        loop {
+                                            match get_camera_status(conn).await {
+                                                Ok(status) => {
+                                                    let _ = sender.send(MessageToClient::CameraStatus(status));
+                                                    break;
+                                                }
+                                                Err(CameraError::Gphoto2Error(ref msg)) if msg.contains("io in progress") && retries < 5 => {
+                                                    retries += 1;
+                                                    tokio::time::sleep(Duration::from_millis(300 * retries)).await;
+                                                }
+                                                Err(e) => {
+                                                    let _ = sender.send(MessageToClient::CameraError(e));
+                                                    break;
+                                                }
+                                            }
+                                        }
                                     }
-                                    Err(e) => {
-                                        let _ = sender.send(MessageToClient::CameraError(e));
-                                    }
-                                }
-                            }
-                            match get_camera_status(&mut connection.as_mut().unwrap()).await {
-                                Ok(status) => {
-                                    let _ = sender.send(MessageToClient::CameraStatus(status));
                                 }
                                 Err(e) => {
                                     let _ = sender.send(MessageToClient::CameraError(e));
@@ -209,7 +215,13 @@ pub fn start_worker(state: AppState) {
                             }
                         }
                         MessageToServer::SetPostProcessingConfigs(configs) => {
-                            let _ = pp_worker_sender.send(configs);
+                            let _ = pp_worker_sender.send(configs).await;
+                        }
+                        MessageToServer::Shutdown => {
+                            println!("Shutting down system...");
+                            let _ = std::process::Command::new("sudo")
+                                .args(&["shutdown", "-h", "now"])
+                                .spawn();
                         }
                         _ => {
                             // Need to establish connection first for all other messages
@@ -237,13 +249,11 @@ pub fn start_worker(state: AppState) {
                 }
                 // connection established, full mode
                 Some(conn) => {
-                    let msg_res = receiver.recv().await;
-
-                    let msg = match msg_res {
-                        Ok(msg) => msg,
-                        Err(e) => {
-                            eprintln!("Error getting websocket2app message: {}", e);
-                            continue;
+                    let msg = match receiver.recv().await {
+                        Some(msg) => msg,
+                        None => {
+                            eprintln!("websocket2app channel closed.");
+                            break;
                         }
                     };
                     let mut res = Ok(());
@@ -311,7 +321,7 @@ async fn handle_msg(
     sender_to_event_loop: tokio::sync::broadcast::Sender<CameraConnection>,
     cancel_channel_sender: tokio::sync::broadcast::Sender<()>,
     event_channel: tokio::sync::broadcast::Sender<Arc<CameraEvent>>,
-    pp_worker_sender: tokio::sync::mpsc::Sender<Vec<crate::websocket::scheme::PostProcessingConfig>>,
+    pp_worker_sender: tokio::sync::mpsc::Sender<Vec<SmartCameraTethering2_shared_types::PostProcessingConfig>>,
 ) -> Result<(), CameraError> {
     println!("Handling websocket2app message: {:?}", msg);
     match msg {
@@ -323,15 +333,26 @@ async fn handle_msg(
         }
         MessageToServer::ConnectToCamera(settings) => {
             let new_connection = connection::connect(settings.clone()).await?;
-            let _ = sender_to_event_loop
-                .send(new_connection.clone());
+            let _ = sender_to_event_loop.send(new_connection.clone());
             *connection = new_connection;
-            match get_camera_status(connection).await {
-                Ok(status) => {
-                    let _ = sender.send(MessageToClient::CameraStatus(status));
-                }
-                Err(e) => {
-                    let _ = sender.send(MessageToClient::CameraError(e));
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            let mut retries = 0u64;
+            loop {
+                match get_camera_status(connection).await {
+                    Ok(status) => {
+                        let _ = sender.send(MessageToClient::CameraStatus(status));
+                        break;
+                    }
+                    Err(CameraError::Gphoto2Error(ref msg)) if msg.contains("io in progress") && retries < 5 => {
+                        retries += 1;
+                        tokio::time::sleep(Duration::from_millis(300 * retries)).await;
+                    }
+                    Err(e) => {
+                        let _ = sender.send(MessageToClient::CameraError(e));
+                        break;
+                    }
                 }
             }
         }
@@ -367,6 +388,12 @@ async fn handle_msg(
         }
         MessageToServer::SetPostProcessingConfigs(configs) => {
             let _ = pp_worker_sender.send(configs.clone()).await;
+        }
+        MessageToServer::Shutdown => {
+            println!("Shutting down system...");
+            let _ = std::process::Command::new("sudo")
+                .args(&["shutdown", "-h", "now"])
+                .spawn();
         }
     }
     Ok(())

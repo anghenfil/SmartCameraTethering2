@@ -43,11 +43,8 @@ export interface BlendImages {
     blending_mode: BlendingMode;
 }
 
-export type OutputDestination = "Camera" | "SystemStorage";
+export type OutputDestination = "Camera" | "SystemStorage" | { ServerStorage: string };
 
-export interface ConvertImage {
-    output_formats: OutputFormat[];
-}
 
 export interface SaveImage {
     output_destination: OutputDestination;
@@ -67,7 +64,6 @@ export interface UploadImage {
 
 export type PostProcessingStep = 
     | { Blend: BlendImages }
-    | { Convert: ConvertImage }
     | { Save: SaveImage } 
     | "Return"
     | { Upload: UploadImage };
@@ -86,7 +82,8 @@ export type MessageToServer =
     | { CaptureImage: CaptureImage }
     | "CapturePreviewImage"
     | "CancelCapture"
-    | { SetPostProcessingConfigs: PostProcessingConfig[] };
+    | { SetPostProcessingConfigs: PostProcessingConfig[] }
+    | "Shutdown";
 
 export interface AvailableFolderOperations {
     delete_all: boolean;
@@ -163,6 +160,7 @@ export interface CameraConfig {
 export interface Image {
     id: string;
     mime_type: string;
+    source: ImageSource;
     data: Uint8Array;
 }
 
@@ -175,6 +173,7 @@ export interface ImageInfo {
 export type ImageSource =
     | "Preview"
     | "Capture"
+    | "PostProcessing"
 
 export type CameraError =
     | { Gphoto2Error: string }

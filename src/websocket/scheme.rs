@@ -3,6 +3,7 @@ use gphoto2::abilities::FolderOperations;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use rsraw_utils::blending::BlendingMode;
+use SmartCameraTethering2_shared_types::PostProcessingConfig;
 
 // first byte of websocket messages
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -89,67 +90,6 @@ pub enum CaptureImage {
     MultipleExposure(MultipleExposureCapture),
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub enum OutputFormat {
-    JPEG,
-    PNG,
-    TIFF,
-    RAW,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct BlendImages {
-    pub number_of_images: u32,
-    pub blending_mode: BlendingMode,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub enum OutputDestination {
-    Camera,
-    SystemStorage,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct ConvertImage {
-    pub output_formats: Vec<OutputFormat>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct SaveImage {
-    pub output_destination: OutputDestination,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct WebdavUploadDestination {
-    pub base_url: String,
-    pub username: Option<String>,
-    pub password: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub enum UploadDestination {
-    Webdav(WebdavUploadDestination),
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct UploadImage {
-    pub upload_destination: UploadDestination,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub enum PostProcessingStep {
-    Blend(BlendImages),
-    Convert(ConvertImage),
-    Save(SaveImage),
-    Return,
-    Upload(UploadImage),
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct PostProcessingConfig {
-    pub steps: Vec<PostProcessingStep>,
-    pub trigger_every_n_images: u32,
-}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum MessageToServer {
@@ -162,6 +102,7 @@ pub enum MessageToServer {
     CapturePreviewImage,
     CancelCapture,
     SetPostProcessingConfigs(Vec<PostProcessingConfig>),
+    Shutdown,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -355,6 +296,7 @@ pub struct Image {
 pub enum ImageSource {
     Preview,
     Capture,
+    PostProcessing,
 }
 
 impl Image {

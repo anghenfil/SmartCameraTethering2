@@ -1,12 +1,26 @@
-use std::path::PathBuf;
-use crate::websocket::scheme::{Image, ImageSource, MessageToClient, OutputDestination, OutputFormat, PostProcessingConfig, PostProcessingStep, UploadDestination};
-use gphoto2::camera::CameraEvent;
+use std::io::BufReader;
 use std::sync::Arc;
-use rsraw::RawImage;
+use gphoto2::camera::CameraEvent;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Mutex;
+use tokio_rustls::TlsConnector;
+use tokio_rustls::client::TlsStream;
+use tokio::net::TcpStream;
+use rustls::ClientConfig;
+use rustls::RootCertStore;
+use rustls::pki_types::ServerName;
+use SmartCameraTethering2_shared_types::{MessageToCameraServer, MessageToPostProcessor, PostProcessingConfig};
 use crate::camera::worker::{CameraConnection, CameraError};
+use crate::websocket::scheme::{Image, ImageSource, MessageToClient};
+
+const SERVER_HOST: &str = "localhost";
+const SERVER_PORT: u16 = 9000;
+const CERT_PATH: &str = "certs/client2.crt";
+const KEY_PATH: &str = "certs/client2.key";
+const CA_PATH: &str = "certs/root.crt";
 
 #[derive(Debug, Clone)]
-struct CameraFilePath{
+struct CameraFilePath {
     pub folder: String,
     pub file: String,
 }
@@ -28,20 +42,42 @@ pub fn start_post_processing_worker(
     let (sender, mut recv) = tokio::sync::mpsc::channel::<Vec<PostProcessingConfig>>(3);
 
     tokio::task::spawn(async move {
-        let mut config = vec![];
-        let mut image_paths : Vec<CameraFilePath> = Vec::new();
-        let mut connection : Option<CameraConnection> = None;
+        let mut config: Vec<PostProcessingConfig> = vec![];
+        let mut connection: Option<CameraConnection> = None;
 
+        let tls_connector = match build_tls_connector() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Failed to build TLS connector: {:?}", e);
+                return;
+            }
+        };
+
+        // Persistent write half of the TLS connection, shared across tasks
+        let write_half: Arc<Mutex<Option<tokio::io::WriteHalf<TlsStream<TcpStream>>>>> =
+            Arc::new(Mutex::new(None));
+
+        // Shared session_id — set by response_reader when server sends SessionId
+        let session_id: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+
+        // Channel to signal that the reader task detected a disconnect
+        let (disconnect_tx, mut disconnect_rx) = tokio::sync::mpsc::channel::<()>(1);
 
         let mut event_channel_receiver = event_channel.subscribe();
         loop {
             tokio::select! {
                 new_config = recv.recv() => {
-                    match new_config{
+                    match new_config {
                         Some(new_config) => {
                             println!("Received new post processing config: {:?}", new_config);
                             config = new_config;
-                        },
+                            let mut w = write_half.lock().await;
+                            if let Some(ref mut writer) = *w {
+                                if let Err(e) = send_framed(writer, &MessageToPostProcessor::SetPostProcessorConfig(config.clone())).await {
+                                        eprintln!("Failed to send config to post-processing server: {:?}", e);
+                                    }
+                            }
+                        }
                         None => {
                             eprintln!("Channel to post processing worker closed.");
                             return;
@@ -49,27 +85,87 @@ pub fn start_post_processing_worker(
                     }
                 },
                 event = event_channel_receiver.recv() => {
-                    match event{
+                    match event {
                         Ok(event) => {
-                            // We only care for new file events
-                            if let CameraEvent::NewFile(new_file) = event.as_ref(){
-                                image_paths.push(new_file.into());
-                            }
+                            if let CameraEvent::NewFile(new_file) = event.as_ref() {
+                                let file_path: CameraFilePath = new_file.into();
+                                let name_lower = file_path.file.to_lowercase();
 
-                            for pp_config in &config{
-                                if pp_config.trigger_every_n_images == 0{
-                                    continue;
-                                }
-                                if (image_paths.len() % pp_config.trigger_every_n_images as usize) == 0{
-                                    if let Some(conn) = &mut connection{
-                                        if let Err(e) = apply_post_processing(&pp_config, &image_paths, conn, &msg2client_sender).await {
-                                            eprintln!("Error in post processing: {:?}", e);
-                                            let _ = msg2client_sender.send(MessageToClient::CameraError(e));
+                                if name_lower.ends_with(".jpg") || name_lower.ends_with(".jpeg") {
+                                    // JPG: download and send directly to client
+                                    if let Some(conn) = &mut connection {
+                                        match conn.camera.fs().download(&file_path.folder, &file_path.file).await {
+                                            Ok(img) => match img.get_data(&conn.context).await {
+                                                Ok(data) => {
+                                                    let image = Image::new(data.to_vec(), "image/jpeg".to_string(), ImageSource::Capture);
+                                                    let _ = msg2client_sender.send(MessageToClient::Image(image));
+                                                }
+                                                Err(e) => {
+                                                    let _ = msg2client_sender.send(MessageToClient::CameraError(e.into()));
+                                                }
+                                            },
+                                            Err(e) => {
+                                                let _ = msg2client_sender.send(MessageToClient::CameraError(e.into()));
+                                            }
                                         }
+                                    }
+                                } else {
+                                    // RAW: send to post-processing server in a background task
+                                    // so the select! loop is not blocked during the transfer
+                                    if let Some(conn) = &connection {
+                                        let conn = conn.clone();
+                                        let file_path = file_path.clone();
+                                        let write_half = write_half.clone();
+                                        let session_id = session_id.clone();
+                                        let config = config.clone();
+                                        let msg2client_sender = msg2client_sender.clone();
+                                        let disconnect_tx = disconnect_tx.clone();
+                                        let tls_connector = tls_connector.clone();
+
+                                        tokio::task::spawn(async move {
+                                            let mut last_err = None;
+                                            for attempt in 1..=3 {
+                                                let mut w = write_half.lock().await;
+                                                if let Some(ref mut writer) = *w {
+                                                    match send_raw_to_server(writer, &conn, &file_path).await {
+                                                        Ok(_) => {
+                                                            last_err = None;
+                                                            break;
+                                                        }
+                                                        Err(e) => {
+                                                            eprintln!("Error sending raw to post-processing server (attempt {}/3): {:?}", attempt, e);
+                                                            last_err = Some(e);
+                                                            *w = None;
+                                                        }
+                                                    }
+                                                } else {
+                                                    break;
+                                                }
+                                                drop(w);
+                                                if attempt < 3 {
+                                                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                                                    let sid = *session_id.lock().await;
+                                                    let is_resume = sid.is_some();
+                                                    establish_connection(
+                                                        &tls_connector,
+                                                        &write_half,
+                                                        &session_id,
+                                                        &config,
+                                                        &msg2client_sender,
+                                                        disconnect_tx.clone(),
+                                                        is_resume,
+                                                    ).await;
+                                                }
+                                            }
+                                            if let Some(e) = last_err {
+                                                let _ = msg2client_sender.send(MessageToClient::CameraError(e));
+                                                let _ = disconnect_tx.send(()).await;
+                                            }
+                                        });
                                     }
                                 }
                             }
-                        },
+                        }
                         Err(e) => {
                             eprintln!("Error receiving camera event: {:?}", e);
                             return;
@@ -77,13 +173,49 @@ pub fn start_post_processing_worker(
                     }
                 },
                 new_connection = connection_channel.recv() => {
-                    match new_connection{
+                    match new_connection {
                         Ok(new_connection) => {
                             connection = Some(new_connection);
-                        },
+                            // Establish a fresh TLS connection (StartSession — new camera connection)
+                            *session_id.lock().await = None;
+                            establish_connection(
+                                &tls_connector,
+                                &write_half,
+                                &session_id,
+                                &config,
+                                &msg2client_sender,
+                                disconnect_tx.clone(),
+                                false,
+                            ).await;
+                        }
                         Err(e) => {
                             eprintln!("Channel to post processing worker closed. {e}");
                         }
+                    }
+                },
+                _ = disconnect_rx.recv() => {
+                    eprintln!("Post-processing server disconnected, attempting reconnect...");
+                    // Retry reconnect with backoff
+                    let mut delay_secs = 1u64;
+                    loop {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(delay_secs)).await;
+                        let sid = *session_id.lock().await;
+                        let is_resume = sid.is_some();
+                        let connected = establish_connection(
+                            &tls_connector,
+                            &write_half,
+                            &session_id,
+                            &config,
+                            &msg2client_sender,
+                            disconnect_tx.clone(),
+                            is_resume,
+                        ).await;
+                        if connected {
+                            println!("Reconnected to post-processing server.");
+                            break;
+                        }
+                        delay_secs = (delay_secs * 2).min(30);
+                        eprintln!("Reconnect failed, retrying in {}s...", delay_secs);
                     }
                 }
             }
@@ -93,200 +225,189 @@ pub fn start_post_processing_worker(
     sender
 }
 
-async fn apply_post_processing(pp_config: &PostProcessingConfig, image_paths: &Vec<CameraFilePath>, connection: &mut CameraConnection, msg2client_sender: &tokio::sync::broadcast::Sender<MessageToClient>) -> Result<(), CameraError>{
-    if let Some(last_image_path) = image_paths.last(){
-        let id = uuid::Uuid::new_v4();
-        let temp_folder = PathBuf::from(format!("temp/{}", id));
-        tokio::fs::create_dir_all(&temp_folder).await?;
+/// Establishes a TLS connection, sends StartSession or ResumeSession, sends current config,
+/// spawns a response reader. Returns true on success.
+async fn establish_connection(
+    tls_connector: &TlsConnector,
+    write_half: &Arc<Mutex<Option<tokio::io::WriteHalf<TlsStream<TcpStream>>>>>,
+    session_id: &Arc<Mutex<Option<u64>>>,
+    config: &[PostProcessingConfig],
+    msg2client_sender: &tokio::sync::broadcast::Sender<MessageToClient>,
+    disconnect_tx: tokio::sync::mpsc::Sender<()>,
+    is_resume: bool,
+) -> bool {
+    match connect_tls(tls_connector).await {
+        Ok(stream) => {
+            let (read_half, new_write_half) = tokio::io::split(stream);
+            {
+                let mut w = write_half.lock().await;
+                *w = Some(new_write_half);
+            }
 
-        // 1. Load image from camera, currently we always expect a raw image
-        let img = connection.camera.fs().download(&last_image_path.folder, &last_image_path.file).await?;
-        let img_data = img.get_data(&connection.context).await?;
-        let mut processed_raw = Some(tokio::task::spawn_blocking(move || -> Result<RawImage, CameraError> {
-            let raw = RawImage::open(&img_data).map_err(|e| CameraError::RsRawUtilError(format!("Couldn't open image form camera as raw: {e}.")))?;
-            Ok(raw)
-        }).await??);
-
-        let base_tiff_path = temp_folder.join("base.tiff");
-        let mut base_tiff_exists = false;
-        let base_tiff_path_cloned = base_tiff_path.clone();
-
-        for step in &pp_config.steps{
-            let ensure_base_tiff = |processed_raw: &mut Option<RawImage>, base_tiff_exists: &mut bool| -> Result<bool, CameraError> {
-                if *base_tiff_exists {
-                    return Ok(true);
-                }
-                if let Some(current_raw) = processed_raw.take() {
-                    let dest = base_tiff_path_cloned.clone();
-                    let runtime = tokio::runtime::Handle::current();
-                    runtime.block_on(tokio::task::spawn_blocking(move || -> Result<(), CameraError> {
-                        rsraw_utils::convert_raw(current_raw, rsraw_utils::OutputFormat::TIFF, &dest).map_err(|e| CameraError::RsRawUtilError(e.to_string()))?;
-                        Ok(())
-                    })).map_err(|e| CameraError::RsRawUtilError(format!("Blocking task failed: {}", e)))??;
-                    *base_tiff_exists = true;
-                    Ok(true)
-                } else {
-                    Ok(false)
-                }
-            };
-
-            match step{
-                PostProcessingStep::Blend(blend_settings) => {
-                    if blend_settings.number_of_images < 2{
-                        return Err(CameraError::RsRawUtilError("At least 2 images are required for blending.".to_string()));
+            // Send StartSession or ResumeSession
+            {
+                let mut w = write_half.lock().await;
+                if let Some(ref mut writer) = *w {
+                    let msg = if is_resume {
+                        let sid = session_id.lock().await;
+                        MessageToPostProcessor::ResumeSession(sid.unwrap())
+                    } else {
+                        MessageToPostProcessor::StartSession
+                    };
+                    if let Err(e) = send_framed(writer, &msg).await {
+                        eprintln!("Failed to send session init message: {:?}", e);
+                        return false;
                     }
-                    if processed_raw.is_none() {
-                        return Err(CameraError::RsRawUtilError("No image available for blending.".to_string()));
-                    }
-
-                    // 2. Open images as raw image
-                    let connection = connection.clone();
-                    let image_paths = image_paths.clone();
-                    let blend_settings = blend_settings.clone();
-                    let image_paths_len = image_paths.len();
-                    let current_raw = processed_raw.take().unwrap();
-
-                    processed_raw = Some(tokio::task::spawn_blocking(async move || -> Result<RawImage, CameraError> {
-                        let mut images_to_blend: Vec<RawImage> = vec![current_raw];
-
-                        let max_image_path_index = image_paths_len-1;
-
-                        let start = if max_image_path_index >= (blend_settings.number_of_images as usize - 1) {
-                            max_image_path_index - (blend_settings.number_of_images as usize - 1)
-                        } else {
-                            0
-                        };
-
-                        for i in start..max_image_path_index {
-                            let img_path = &image_paths[i];
-                            let img = connection.camera.fs().download(&img_path.folder, &img_path.file).await?;
-                            let img_data = img.get_data(&connection.context).await?;
-                            let img = RawImage::open(&img_data).map_err(|_| CameraError::RsRawUtilError("Couldn't open image form camera as raw.".to_string()))?;
-                            images_to_blend.push(img);
-                        }
-                        rsraw_utils::blend_raw_images(images_to_blend, blend_settings.blending_mode).map_err(|e|e.into())
-                    }).await?.await?);
-
-                    // Reset base tiff exists so it gets regenerated from the blended image
-                    base_tiff_exists = false;
-                }
-                PostProcessingStep::Convert(convert_settings) => {
-                    if !ensure_base_tiff(&mut processed_raw, &mut base_tiff_exists)? {
-                        return Err(CameraError::RsRawUtilError("No image available for conversion.".to_string()));
-                    }
-
-                    for format in &convert_settings.output_formats {
-                        let extension = match format {
-                            OutputFormat::JPEG => "jpg",
-                            OutputFormat::PNG => "png",
-                            OutputFormat::TIFF => "tiff",
-                            OutputFormat::RAW => continue,
-                        };
-
-                        let dest_path = temp_folder.join(format!("image.{}", extension));
-
-                        if matches!(format, OutputFormat::TIFF) {
-                            tokio::fs::copy(&base_tiff_path_cloned, &dest_path).await?;
-                            continue;
-                        }
-
-                        let src = base_tiff_path_cloned.clone();
-                        let format_to_save = match format {
-                             OutputFormat::JPEG => image::ImageFormat::Jpeg,
-                             OutputFormat::PNG => image::ImageFormat::Png,
-                             _ => unreachable!(),
-                        };
-
-                        tokio::task::spawn_blocking(move || -> Result<(), CameraError> {
-                            let img = image::open(&src).map_err(|e| CameraError::RsRawUtilError(format!("Failed to open base tiff: {}", e)))?;
-                            img.save_with_format(&dest_path, format_to_save).map_err(|e| CameraError::RsRawUtilError(format!("Failed to save converted image: {}", e)))?;
-                            Ok(())
-                        }).await??;
-                    }
-                }
-                PostProcessingStep::Save(save_settings) => {
-                    if !ensure_base_tiff(&mut processed_raw, &mut base_tiff_exists)? {
-                        return Err(CameraError::RsRawUtilError("No image available for saving.".to_string()));
-                    }
-
-                    match save_settings.output_destination {
-                        OutputDestination::SystemStorage => {
-                            let data_folder = PathBuf::from("data").join(id.to_string());
-                            tokio::fs::create_dir_all(&data_folder).await?;
-                            let mut entries = tokio::fs::read_dir(&temp_folder).await?;
-                            while let Some(entry) = entries.next_entry().await? {
-                                let dest = data_folder.join(entry.file_name());
-                                tokio::fs::copy(entry.path(), dest).await?;
-                            }
-                        }
-                        OutputDestination::Camera => {
-                            eprintln!("Saving to camera is not implemented.");
-                        }
-                    }
-                }
-                PostProcessingStep::Return => {
-                    if !ensure_base_tiff(&mut processed_raw, &mut base_tiff_exists)? {
-                        return Err(CameraError::RsRawUtilError("No image available to return.".to_string()));
-                    }
-                    
-                    let src = base_tiff_path_cloned.clone();
-                    let jpg_data = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, CameraError> {
-                        let img = image::open(&src).map_err(|e| CameraError::RsRawUtilError(format!("Failed to open base tiff: {}", e)))?;
-                        let mut buffer = std::io::Cursor::new(Vec::new());
-                        img.write_to(&mut buffer, image::ImageFormat::Jpeg).map_err(|e| CameraError::RsRawUtilError(format!("Failed to convert image to JPEG: {}", e)))?;
-                        Ok(buffer.into_inner())
-                    }).await??;
-
-                    let image = Image::new(jpg_data, "image/jpeg".to_string(), ImageSource::Capture);
-                    let _ = msg2client_sender.send(MessageToClient::Image(image));
-                }
-                PostProcessingStep::Upload(upload_settings) => {
-                    if !ensure_base_tiff(&mut processed_raw, &mut base_tiff_exists)? {
-                        return Err(CameraError::RsRawUtilError("No image available for upload.".to_string()));
-                    }
-
-                    match &upload_settings.upload_destination {
-                        UploadDestination::Webdav(webdav_settings) => {
-                            let mut entries = tokio::fs::read_dir(&temp_folder).await?;
-                            let client = reqwest::Client::new();
-
-                            while let Some(entry) = entries.next_entry().await? {
-                                let path = entry.path();
-                                if path.is_file() {
-                                    let file_name = entry.file_name();
-                                    let file_name_str = file_name.to_string_lossy();
-                                    let url = if webdav_settings.base_url.ends_with('/') {
-                                        format!("{}{}", webdav_settings.base_url, file_name_str)
-                                    } else {
-                                        format!("{}/{}", webdav_settings.base_url, file_name_str)
-                                    };
-
-                                    let file_content = tokio::fs::read(&path).await?;
-                                    let mut request = client.put(&url).body(file_content);
-
-                                    if let (Some(user), Some(pass)) = (&webdav_settings.username, &webdav_settings.password) {
-                                        request = request.basic_auth(user, Some(pass));
-                                    }
-
-                                    match request.send().await {
-                                        Ok(response) => {
-                                            if !response.status().is_success() {
-                                                return Err(CameraError::RsRawUtilError(format!("Failed to upload {} to WebDAV: HTTP {}", file_name_str, response.status())));
-                                            } else {
-                                                println!("Successfully uploaded {} to WebDAV", file_name_str);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            return Err(CameraError::RsRawUtilError(format!("Error uploading {} to WebDAV: {}", file_name_str, e)));
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                    // Send current config
+                    if let Err(e) = send_framed(writer, &MessageToPostProcessor::SetPostProcessorConfig(config.to_vec())).await {
+                        eprintln!("Failed to send initial config to post-processing server: {:?}", e);
                     }
                 }
             }
+
+            // Spawn reader task
+            let sender_clone = msg2client_sender.clone();
+            let session_id_clone = session_id.clone();
+            let write_half_clone = write_half.clone();
+            tokio::spawn(async move {
+                response_reader(read_half, sender_clone, session_id_clone, write_half_clone, disconnect_tx).await;
+            });
+            true
+        }
+        Err(e) => {
+            eprintln!("Failed to connect to post-processing server: {:?}", e);
+            false
         }
     }
+}
+
+/// Reads responses from the server at any time and forwards images to websocket clients.
+async fn response_reader(
+    mut read_half: tokio::io::ReadHalf<TlsStream<TcpStream>>,
+    msg2client_sender: tokio::sync::broadcast::Sender<MessageToClient>,
+    session_id: Arc<Mutex<Option<u64>>>,
+    write_half: Arc<Mutex<Option<tokio::io::WriteHalf<TlsStream<TcpStream>>>>>,
+    disconnect_tx: tokio::sync::mpsc::Sender<()>,
+) {
+    loop {
+        match recv_framed(&mut read_half).await {
+            Ok(bytes) => {
+                enum Parsed { SessionId(u64), ReturnedImage(Vec<u8>), SaveToSystemStorage { filename: String, data: Vec<u8> }, Error }
+                let parsed = match rkyv::from_bytes::<MessageToCameraServer>(&bytes) {
+                    Ok(MessageToCameraServer::SessionId(id)) => Parsed::SessionId(id),
+                    Ok(MessageToCameraServer::ReturnedImage(data)) => Parsed::ReturnedImage(data),
+                    Ok(MessageToCameraServer::SaveToSystemStorage { filename, data }) => Parsed::SaveToSystemStorage { filename, data },
+                    Err(e) => { eprintln!("Failed to deserialize server response: {:?}", e); Parsed::Error }
+                };
+                match parsed {
+                    Parsed::SessionId(id) => {
+                        println!("Session ID assigned by server: {}", id);
+                        *session_id.lock().await = Some(id);
+                    }
+                    Parsed::ReturnedImage(image_data) => {
+                        println!("Received processed image ({} bytes) from server.", image_data.len());
+                        let image = Image::new(image_data, "image/jpeg".to_string(), ImageSource::PostProcessing);
+                        let _ = msg2client_sender.send(MessageToClient::Image(image));
+                    }
+                    Parsed::SaveToSystemStorage { filename, data } => {
+                        let dir = std::path::PathBuf::from("data");
+                        if let Err(e) = std::fs::create_dir_all(&dir) {
+                            eprintln!("Failed to create data directory: {:?}", e);
+                        } else {
+                            let path = dir.join(&filename);
+                            match std::fs::write(&path, &data) {
+                                Ok(_) => println!("Saved image to system storage: {:?}", path),
+                                Err(e) => eprintln!("Failed to save image to system storage {:?}: {:?}", path, e),
+                            }
+                        }
+                    }
+                    Parsed::Error => {}
+                }
+            }
+            Err(e) => {
+                eprintln!("Server connection closed or read error: {:?}", e);
+                // Clear write half so sends fail fast
+                *write_half.lock().await = None;
+                let _ = disconnect_tx.send(()).await;
+                return;
+            }
+        }
+    }
+}
+
+fn build_tls_connector() -> Result<TlsConnector, Box<dyn std::error::Error + Send + Sync>> {
+    let cert_file = std::fs::File::open(CERT_PATH)?;
+    let certs: Vec<rustls::pki_types::CertificateDer> =
+        rustls_pemfile::certs(&mut BufReader::new(cert_file))
+            .map(|r| r.expect("Invalid cert PEM"))
+            .collect();
+
+    let key_file = std::fs::File::open(KEY_PATH)?;
+    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))?
+        .ok_or("No private key found")?;
+
+    let ca_file = std::fs::File::open(CA_PATH)?;
+    let ca_certs: Vec<rustls::pki_types::CertificateDer> =
+        rustls_pemfile::certs(&mut BufReader::new(ca_file))
+            .map(|r| r.expect("Invalid CA cert PEM"))
+            .collect();
+
+    let mut root_store = RootCertStore::empty();
+    for ca_cert in ca_certs {
+        root_store.add(ca_cert)?;
+    }
+
+    let config = ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_client_auth_cert(certs, key)?;
+
+    Ok(TlsConnector::from(Arc::new(config)))
+}
+
+async fn connect_tls(connector: &TlsConnector) -> Result<TlsStream<TcpStream>, Box<dyn std::error::Error + Send + Sync>> {
+    let tcp = tokio::net::TcpStream::connect(format!("{}:{}", SERVER_HOST, SERVER_PORT)).await?;
+    let server_name = ServerName::try_from(SERVER_HOST.to_string())?;
+    let tls_stream = connector.connect(server_name, tcp).await?;
+    Ok(tls_stream)
+}
+
+async fn send_framed<S, M>(stream: &mut S, message: &M) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: AsyncWriteExt + Unpin,
+    M: rkyv::Serialize<rkyv::ser::serializers::AllocSerializer<4096>>,
+{
+    let bytes = rkyv::to_bytes::<_, 4096>(message)
+        .map_err(|e| format!("Serialization error: {:?}", e))?;
+    let len = bytes.len() as u32;
+    stream.write_all(&len.to_be_bytes()).await?;
+    stream.write_all(&bytes).await?;
+    Ok(())
+}
+
+async fn recv_framed<S>(stream: &mut S) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>
+where
+    S: AsyncReadExt + Unpin,
+{
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).await?;
+    let msg_len = u32::from_be_bytes(len_buf) as usize;
+    let mut buf = vec![0u8; msg_len];
+    stream.read_exact(&mut buf).await?;
+    Ok(buf)
+}
+
+async fn send_raw_to_server(
+    writer: &mut tokio::io::WriteHalf<TlsStream<TcpStream>>,
+    connection: &CameraConnection,
+    image_path: &CameraFilePath,
+) -> Result<(), CameraError> {
+    let img = connection.camera.fs().download(&image_path.folder, &image_path.file).await?;
+    let img_data = img.get_data(&connection.context).await?;
+
+    println!("Sending raw image ({} bytes) to post-processing server...", img_data.len());
+
+    send_framed(writer, &MessageToPostProcessor::RawImage(img_data.to_vec())).await
+        .map_err(|e| CameraError::RsRawUtilError(format!("Send failed: {e}")))?;
+
     Ok(())
 }
